@@ -1,0 +1,7 @@
+mujoco==2.2.0
+mujoco-python-viewer
+ray==1.9.2
+transforms3d
+matplotlib
+scipy
+wandb

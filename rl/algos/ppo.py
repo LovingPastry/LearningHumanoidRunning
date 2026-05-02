@@ -13,9 +13,15 @@ import sys
 import time
 import numpy as np
 import matplotlib.pyplot as plt
+import mujoco
 
 import ray
 from rl.envs import WrapEnv
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 class PPOBuffer:
@@ -116,6 +122,13 @@ class PPO:
         self.grad_clip      = args['max_grad_norm']   # 梯度裁剪阈值
         self.mirror_coeff   = args['mirror_coeff']    # 镜像对称损失系数
         self.eval_freq      = args['eval_freq']       # 评估频率
+        self.use_wandb      = args.get('use_wandb', False)
+        self.wandb_project  = args.get('wandb_project', 'LearningHumanoidRunning')
+        self.wandb_entity   = args.get('wandb_entity', None)
+        self.wandb_run_name = args.get('wandb_run_name', None)
+        self.wandb_video_freq = args.get('wandb_video_freq', 0)
+        self.wandb_video_len  = args.get('wandb_video_len', 600)
+        self.wandb_video_fps  = args.get('wandb_video_fps', 30)
 
         self.recurrent = False  # 是否使用循环网络
 
@@ -144,6 +157,21 @@ class PPO:
         self.train_fn = os.path.join(self.save_path, 'train.txt')
         with open(self.train_fn, 'w') as out:
             out.write("ep_returns,ep_lens\n")
+
+        self.wandb_run = None
+        if self.use_wandb:
+            if wandb is None:
+                print("Warning: --use_wandb is set but `wandb` is not installed. Skip wandb logging.")
+                self.use_wandb = False
+            else:
+                self.wandb_run = wandb.init(
+                    project=self.wandb_project,
+                    entity=self.wandb_entity,
+                    name=self.wandb_run_name,
+                    config=args,
+                    dir=self.save_path,
+                    reinit=True,
+                )
 
         # Ray并行计算初始化（注释掉的代码）
         # os.environ['OMP_NUM_THREA DS'] = '1'
@@ -253,6 +281,50 @@ class PPO:
         total_buf = merge(result)
 
         return total_buf
+
+    @torch.no_grad()
+    def render_eval_video(self, env_fn, policy, max_steps=600):
+        """渲染一次确定性策略 rollout，返回 TCHW uint8 视频数组"""
+        env = WrapEnv(env_fn)
+        state = torch.Tensor(env.reset())
+        done = False
+        steps = 0
+        frames = []
+        renderer = None
+
+        if hasattr(policy, 'init_hidden_state'):
+            policy.init_hidden_state()
+
+        try:
+            if not hasattr(env, "model") or not hasattr(env, "data"):
+                return None
+            renderer = mujoco.Renderer(env.model, height=480, width=640)
+            while (not done) and steps < max_steps:
+                action = policy(state, deterministic=True, anneal=1.0)
+                next_state, _, done_arr, _ = env.step(action.numpy())
+                done = bool(done_arr[0])
+                state = torch.Tensor(next_state)
+
+                renderer.update_scene(env.data)
+                frame = renderer.render()
+                frames.append(frame.copy())
+                steps += 1
+        except Exception as e:
+            print("Warning: failed to render eval video:", e)
+            return None
+        finally:
+            try:
+                env.close()
+            except Exception:
+                pass
+            if renderer is not None:
+                renderer.close()
+
+        if len(frames) == 0:
+            return None
+        video = np.stack(frames, axis=0)  # THWC
+        video = np.transpose(video, (0, 3, 1, 2))  # TCHW
+        return video
 
     def update_policy(self, obs_batch, action_batch, return_batch, advantage_batch, mask, mirror_observation=None, mirror_action=None):
         """更新策略网络和值函数网络"""
@@ -500,6 +572,20 @@ class PPO:
             # 保存训练指标
             with open(self.train_fn, 'a') as out:
                 out.write("{},{}\n".format(np.mean(batch.ep_returns), np.mean(batch.ep_lens)))
+            if self.use_wandb:
+                wandb.log({
+                    "train/iter": itr,
+                    "train/ep_returns": float(np.mean(batch.ep_returns)),
+                    "train/ep_lens": float(np.mean(batch.ep_lens)),
+                    "train/actor_loss": float(np.mean(actor_losses)),
+                    "train/critic_loss": float(np.mean(critic_losses)),
+                    "train/mirror_loss": float(np.mean(mirror_losses)),
+                    "train/mean_kl": float(np.mean(kls)),
+                    "train/mean_entropy": float(np.mean(entropies)),
+                    "train/clip_fraction": float(np.mean(clip_fractions)),
+                    "train/total_steps": int(self.total_steps),
+                    "train/fps": float(self.total_steps / elapsed),
+                }, step=itr)
 
             # 定期评估
             if (itr+1)%self.eval_freq==0:
@@ -537,3 +623,21 @@ class PPO:
                 if self.highest_reward < avg_eval_reward:
                     self.highest_reward = avg_eval_reward
                     self.save(policy, critic)
+
+                if self.use_wandb:
+                    log_data = {
+                        "eval/iter": itr,
+                        "eval/ep_returns": float(np.mean(test.ep_returns)),
+                        "eval/ep_lens": float(np.mean(test.ep_lens)),
+                        "eval/best_ep_returns": float(self.highest_reward),
+                    }
+                    eval_index = (itr + 1) // self.eval_freq
+                    should_log_video = self.wandb_video_freq > 0 and (eval_index % self.wandb_video_freq == 0)
+                    if should_log_video:
+                        video = self.render_eval_video(env_fn, self.policy, max_steps=self.wandb_video_len)
+                        if video is not None:
+                            log_data["eval/video"] = wandb.Video(video, fps=self.wandb_video_fps, format="gif")
+                    wandb.log(log_data, step=itr)
+
+        if self.use_wandb and self.wandb_run is not None:
+            self.wandb_run.finish()

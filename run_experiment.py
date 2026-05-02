@@ -123,6 +123,13 @@ if __name__ == "__main__":
     parser.add_argument("--mirror_coeff", required=False, default=0.4, type=float, help="weight for mirror loss")
     parser.add_argument("--eval_freq", required=False, default=100, type=int, help="Frequency of performing evaluation")
     parser.add_argument("--continued", required=False, default=None, type=str, help="path to pretrained weights")
+    parser.add_argument("--use_wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb_project", type=str, default="LearningHumanoidRunning", help="wandb project name")
+    parser.add_argument("--wandb_entity", type=str, default=None, help="wandb entity/team (optional)")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="wandb run name (optional)")
+    parser.add_argument("--wandb_video_freq", type=int, default=0, help="Log eval video every N evals (0 disables video)")
+    parser.add_argument("--wandb_video_len", type=int, default=600, help="Max timesteps per logged eval video")
+    parser.add_argument("--wandb_video_fps", type=int, default=30, help="FPS for logged eval video")
     args = parser.parse_args()
 
     run_experiment(args)
