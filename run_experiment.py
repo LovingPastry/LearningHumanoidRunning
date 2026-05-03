@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import re
 import ray
 from functools import partial
 
@@ -14,6 +15,69 @@ from rl.policies.actor import Gaussian_FF_Actor
 from rl.policies.critic import FF_V
 from rl.envs.normalize import get_normalization_params
 from rl.envs.wrappers import SymmetricEnv
+
+
+def parse_iteration_from_checkpoint(path):
+    match = re.search(r'_(\d+)\.pt$', os.path.basename(path))
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def resolve_resume_paths(continued):
+    actor_path = None
+    critic_path = None
+    training_state_path = None
+
+    if os.path.isdir(continued):
+        actor_path = os.path.join(continued, "actor.pt")
+        critic_path = os.path.join(continued, "critic.pt")
+        candidate_state = os.path.join(continued, "training_state.pt")
+        if os.path.isfile(candidate_state):
+            training_state_path = candidate_state
+    elif os.path.isfile(continued):
+        basename = os.path.basename(continued)
+        dirname = os.path.dirname(continued)
+        if basename.startswith("training_state") and basename.endswith(".pt"):
+            training_state_path = continued
+        elif basename.startswith("actor") and basename.endswith(".pt"):
+            actor_path = continued
+            critic_path = os.path.join(dirname, basename.replace("actor", "critic", 1))
+            suffix = basename[len("actor"):-3]
+            candidate_state = os.path.join(dirname, "training_state" + suffix + ".pt")
+            if os.path.isfile(candidate_state):
+                training_state_path = candidate_state
+        elif basename.startswith("critic") and basename.endswith(".pt"):
+            critic_path = continued
+            actor_path = os.path.join(dirname, basename.replace("critic", "actor", 1))
+            suffix = basename[len("critic"):-3]
+            candidate_state = os.path.join(dirname, "training_state" + suffix + ".pt")
+            if os.path.isfile(candidate_state):
+                training_state_path = candidate_state
+
+    if training_state_path is not None:
+        training_state = torch.load(training_state_path, map_location='cpu')
+        actor_path = training_state.get('actor_path', actor_path)
+        critic_path = training_state.get('critic_path', critic_path)
+        resume_iteration = training_state.get('iteration')
+    else:
+        training_state = None
+        resume_iteration = parse_iteration_from_checkpoint(actor_path) if actor_path else None
+
+    if actor_path is None or critic_path is None:
+        raise ValueError("Could not resolve actor/critic checkpoint paths from --continued")
+    if not os.path.isfile(actor_path):
+        raise FileNotFoundError("Actor checkpoint not found: {}".format(actor_path))
+    if not os.path.isfile(critic_path):
+        raise FileNotFoundError("Critic checkpoint not found: {}".format(critic_path))
+
+    return {
+        "actor_path": actor_path,
+        "critic_path": critic_path,
+        "training_state_path": training_state_path,
+        "training_state": training_state,
+        "resume_iteration": resume_iteration,
+    }
 
 def import_env(env_name_str):
     if env_name_str=='jvrc_walk':
@@ -57,16 +121,11 @@ def run_experiment(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    resume_info = None
     if args.continued:
-        path_to_actor = ""
-        path_to_pkl = ""
-        if os.path.isfile(args.continued) and args.continued.endswith(".pt"):
-            path_to_actor = args.continued
-        if os.path.isdir(args.continued):
-            path_to_actor = os.path.join(args.continued, "actor.pt")
-        path_to_critic = path_to_actor.split('actor')[0]+'critic'+path_to_actor.split('actor')[1]
-        policy = torch.load(path_to_actor)
-        critic = torch.load(path_to_critic)
+        resume_info = resolve_resume_paths(args.continued)
+        policy = torch.load(resume_info["actor_path"], map_location='cpu')
+        critic = torch.load(resume_info["critic_path"], map_location='cpu')
     else:
         policy = Gaussian_FF_Actor(obs_dim, action_dim, fixed_std=np.exp(args.std_dev), bounded=False)
         critic = FF_V(obs_dim)
@@ -90,7 +149,15 @@ def run_experiment(args):
         pickle.dump(args, f)
 
     algo = PPO(args=vars(args), save_path=args.logdir)
-    algo.train(env_fn, policy, critic, args.n_itr, anneal_rate=args.anneal)
+    algo.train(
+        env_fn,
+        policy,
+        critic,
+        args.n_itr,
+        anneal_rate=args.anneal,
+        resume_state=resume_info["training_state"] if resume_info else None,
+        resume_iteration=resume_info["resume_iteration"] if resume_info else None,
+    )
 
 if __name__ == "__main__":
 
@@ -130,6 +197,7 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_video_freq", type=int, default=0, help="Log eval video every N evals (0 disables video)")
     parser.add_argument("--wandb_video_len", type=int, default=600, help="Max timesteps per logged eval video")
     parser.add_argument("--wandb_video_fps", type=int, default=30, help="FPS for logged eval video")
+    parser.add_argument("--wandb_video_on_start", action="store_true", help="Run an evaluation and try to log a video before the first training iteration")
     args = parser.parse_args()
 
     run_experiment(args)
