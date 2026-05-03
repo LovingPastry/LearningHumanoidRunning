@@ -1,4 +1,4 @@
-# LearningHumanoidRunning
+<h1 align="center"><a href="https://github.com/LovingPastry/LearningHumanoidRunning">LearningHumanoidRunning</a></h1>
 
 ![climb_down](https://github.com/user-attachments/assets/0cbca7ab-ade9-4e77-9b5c-9d2fafead47f)
 
