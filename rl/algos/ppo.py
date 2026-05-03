@@ -129,6 +129,8 @@ class PPO:
         self.wandb_video_freq = args.get('wandb_video_freq', 0)
         self.wandb_video_len  = args.get('wandb_video_len', 600)
         self.wandb_video_fps  = args.get('wandb_video_fps', 30)
+        self.wandb_video_on_start = args.get('wandb_video_on_start', False)
+        self.wandb_video_disabled = False
 
         self.recurrent = False  # 是否使用循环网络
 
@@ -151,12 +153,14 @@ class PPO:
         # 保存路径和日志文件
         self.save_path = save_path
         self.eval_fn = os.path.join(self.save_path, 'eval.txt')
-        with open(self.eval_fn, 'w') as out:
-            out.write("test_ep_returns,test_ep_lens\n")
+        if (not os.path.exists(self.eval_fn)) or os.path.getsize(self.eval_fn) == 0:
+            with open(self.eval_fn, 'w') as out:
+                out.write("test_ep_returns,test_ep_lens\n")
 
         self.train_fn = os.path.join(self.save_path, 'train.txt')
-        with open(self.train_fn, 'w') as out:
-            out.write("ep_returns,ep_lens\n")
+        if (not os.path.exists(self.train_fn)) or os.path.getsize(self.train_fn) == 0:
+            with open(self.train_fn, 'w') as out:
+                out.write("ep_returns,ep_lens\n")
 
         self.wandb_run = None
         if self.use_wandb:
@@ -189,6 +193,130 @@ class PPO:
         filetype = ".pt" # pytorch模型
         torch.save(policy, os.path.join(self.save_path, "actor" + suffix + filetype))
         torch.save(critic, os.path.join(self.save_path, "critic" + suffix + filetype))
+
+    def save_training_state(self, policy, critic, itr, curriculum_state, suffix="", model_suffix=None):
+        if model_suffix is None:
+            model_suffix = suffix
+        actor_path = os.path.join(self.save_path, "actor" + model_suffix + ".pt")
+        critic_path = os.path.join(self.save_path, "critic" + model_suffix + ".pt")
+        training_state = {
+            "iteration": itr,
+            "actor_path": actor_path,
+            "critic_path": critic_path,
+            "actor_optimizer": self.actor_optimizer.state_dict(),
+            "critic_optimizer": self.critic_optimizer.state_dict(),
+            "total_steps": self.total_steps,
+            "highest_reward": self.highest_reward,
+            "curriculum_state": curriculum_state,
+        }
+        torch.save(training_state, os.path.join(self.save_path, "training_state" + suffix + ".pt"))
+
+    def load_training_state(self, resume_state):
+        if not resume_state:
+            return 0, {}
+
+        actor_optimizer_state = resume_state.get("actor_optimizer")
+        critic_optimizer_state = resume_state.get("critic_optimizer")
+        if actor_optimizer_state is not None:
+            self.actor_optimizer.load_state_dict(actor_optimizer_state)
+        if critic_optimizer_state is not None:
+            self.critic_optimizer.load_state_dict(critic_optimizer_state)
+
+        self.total_steps = resume_state.get("total_steps", self.total_steps)
+        self.highest_reward = resume_state.get("highest_reward", self.highest_reward)
+        self.iteration_count = resume_state.get("iteration", self.iteration_count)
+
+        curriculum_state = resume_state.get("curriculum_state", {})
+        next_itr = resume_state.get("iteration", -1) + 1
+        return next_itr, curriculum_state
+
+    def load_eval_history(self):
+        test_ep_returns = []
+        test_ep_lens = []
+        if not os.path.isfile(self.eval_fn):
+            return test_ep_returns, test_ep_lens
+
+        with open(self.eval_fn, 'r') as handle:
+            lines = handle.readlines()[1:]
+        for line in lines:
+            parts = line.strip().split(',')
+            if len(parts) != 2:
+                continue
+            try:
+                test_ep_returns.append(float(parts[0]))
+                test_ep_lens.append(float(parts[1]))
+            except ValueError:
+                continue
+        return test_ep_returns, test_ep_lens
+
+    def maybe_get_wandb_video(self, video):
+        if (not self.use_wandb) or self.wandb_video_disabled or video is None:
+            return None
+
+        try:
+            return wandb.Video(video, fps=self.wandb_video_fps, format="gif")
+        except Exception as e:
+            print("Warning: failed to encode wandb video:", e)
+            self.wandb_video_disabled = True
+            return None
+
+    def run_evaluation(self, env_fn, itr, test_ep_returns, test_ep_lens, force_video=False):
+        evaluate_start = time.time()
+        test = self.sample_parallel(env_fn, self.policy, self.critic, self.batch_size, self.max_traj_len, deterministic=True)
+        eval_time = time.time() - evaluate_start
+        print("evaluate time elapsed: {:.2f} s".format(eval_time))
+
+        avg_eval_reward = np.mean(test.ep_returns)
+        print("====EVALUATE EPISODE====  (Return = {})".format(avg_eval_reward))
+
+        with open(self.eval_fn, 'a') as out:
+            out.write("{},{}\n".format(np.mean(test.ep_returns), np.mean(test.ep_lens)))
+        test_ep_lens.append(np.mean(test.ep_lens))
+        test_ep_returns.append(np.mean(test.ep_returns))
+
+        plt.clf()
+        xlabel = [i*self.eval_freq for i in range(len(test_ep_lens))]
+        plt.plot(xlabel, test_ep_lens, color='blue', marker='o', label='Ep lens')
+        plt.plot(xlabel, test_ep_returns, color='green', marker='o', label='Returns')
+        plt.xticks(np.arange(0, max(itr, 0)+1, step=self.eval_freq))
+        plt.xlabel('Iterations')
+        plt.ylabel('Returns/Episode lengths')
+        plt.legend()
+        plt.grid()
+        plt.savefig(os.path.join(self.save_path, 'eval.svg'), bbox_inches='tight')
+
+        self.save(self.policy, self.critic, "_" + repr(itr))
+        curriculum_state = {
+            "curr_anneal": getattr(self, "curr_anneal", 1.0),
+            "curr_thresh": getattr(self, "curr_thresh", 0),
+            "term_start_itr": getattr(self, "term_start_itr", 0),
+            "ep_counter": getattr(self, "ep_counter", 0),
+            "do_term": getattr(self, "do_term", False),
+        }
+        self.save_training_state(self.policy, self.critic, itr, curriculum_state, "_" + repr(itr))
+
+        if self.highest_reward < avg_eval_reward:
+            self.highest_reward = avg_eval_reward
+            self.save(self.policy, self.critic)
+        self.save_training_state(self.policy, self.critic, itr, curriculum_state, model_suffix="_" + repr(itr))
+
+        if self.use_wandb:
+            log_data = {
+                "eval/iter": itr,
+                "eval/ep_returns": float(np.mean(test.ep_returns)),
+                "eval/ep_lens": float(np.mean(test.ep_lens)),
+                "eval/best_ep_returns": float(self.highest_reward),
+            }
+            eval_index = max((itr + 1) // self.eval_freq, 0)
+            should_log_video = force_video or (
+                self.wandb_video_freq > 0 and eval_index > 0 and (eval_index % self.wandb_video_freq == 0)
+            )
+            if should_log_video:
+                video = self.render_eval_video(env_fn, self.policy, max_steps=self.wandb_video_len)
+                wandb_video = self.maybe_get_wandb_video(video)
+                if wandb_video is not None:
+                    log_data["eval/video"] = wandb_video
+            wandb.log(log_data, step=itr)
 
     @ray.remote
     @torch.no_grad()
@@ -318,7 +446,9 @@ class PPO:
             except Exception:
                 pass
             if renderer is not None:
-                renderer.close()
+                close_fn = getattr(renderer, "close", None)
+                if callable(close_fn):
+                    close_fn()
 
         if len(frames) == 0:
             return None
@@ -391,7 +521,9 @@ class PPO:
               policy,
               critic,
               n_itr,
-              anneal_rate=1.0):
+              anneal_rate=1.0,
+              resume_state=None,
+              resume_iteration=None):
         """主训练循环"""
 
         # 初始化旧策略（用于重要性采样）
@@ -416,16 +548,38 @@ class PPO:
         # 课程学习参数
         curr_anneal = 1.0    # 当前退火系数
         curr_thresh = 0      # 当前终止阈值
-        start_itr = 0        # 开始迭代
+        resume_start_itr = 0 # 恢复训练的起始迭代
+        term_start_itr = 0   # 课程学习开始的迭代
         ep_counter = 0       # episode计数器
         do_term = False      # 是否启用提前终止
 
         # 评估统计
-        test_ep_lens = []
-        test_ep_returns = []
+        test_ep_returns, test_ep_lens = self.load_eval_history()
+
+        if resume_state is not None:
+            resume_start_itr, curriculum_state = self.load_training_state(resume_state)
+            curr_anneal = curriculum_state.get("curr_anneal", curr_anneal)
+            curr_thresh = curriculum_state.get("curr_thresh", curr_thresh)
+            ep_counter = curriculum_state.get("ep_counter", ep_counter)
+            do_term = curriculum_state.get("do_term", do_term)
+            term_start_itr = curriculum_state.get("term_start_itr", term_start_itr)
+        elif resume_iteration is not None:
+            resume_start_itr = resume_iteration + 1
+
+        self.curr_anneal = curr_anneal
+        self.curr_thresh = curr_thresh
+        self.term_start_itr = term_start_itr
+        self.ep_counter = ep_counter
+        self.do_term = do_term
+
+        if self.wandb_video_on_start:
+            initial_eval_itr = resume_start_itr - 1
+            self.run_evaluation(env_fn, initial_eval_itr, test_ep_returns, test_ep_lens, force_video=True)
+
+        end_itr = resume_start_itr + n_itr
 
         # 主训练循环
-        for itr in range(n_itr):
+        for itr in range(resume_start_itr, end_itr):
             print("********** Iteration {} ************".format(itr))
 
             # 设置迭代计数（可用于课程学习）
@@ -438,7 +592,13 @@ class PPO:
                 curr_anneal *= anneal_rate
             # 自适应提前终止阈值
             if do_term and curr_thresh < 0.35:
-                curr_thresh = .1 * 1.0006**(itr-start_itr)
+                curr_thresh = .1 * 1.0006**(itr-term_start_itr)
+
+            self.curr_anneal = curr_anneal
+            self.curr_thresh = curr_thresh
+            self.term_start_itr = term_start_itr
+            self.ep_counter = ep_counter
+            self.do_term = do_term
 
             # 并行采样经验
             batch = self.sample_parallel(env_fn, self.policy, self.critic, self.batch_size, self.max_traj_len, anneal=curr_anneal, term_thresh=curr_thresh)
@@ -551,7 +711,13 @@ class PPO:
                 ep_counter += 1
             if do_term == False and ep_counter > 50:
                 do_term = True
-                start_itr = itr
+                term_start_itr = itr
+
+            self.curr_anneal = curr_anneal
+            self.curr_thresh = curr_thresh
+            self.term_start_itr = term_start_itr
+            self.ep_counter = ep_counter
+            self.do_term = do_term
 
             # 输出训练统计
             sys.stdout.write("-" * 37 + "\n")
@@ -589,55 +755,7 @@ class PPO:
 
             # 定期评估
             if (itr+1)%self.eval_freq==0:
-                # 评估阶段
-                evaluate_start = time.time()
-                test = self.sample_parallel(env_fn, self.policy, self.critic, self.batch_size, self.max_traj_len, deterministic=True)
-                eval_time = time.time() - evaluate_start
-                print("evaluate time elapsed: {:.2f} s".format(eval_time))
-
-                avg_eval_reward = np.mean(test.ep_returns)
-                print("====EVALUATE EPISODE====  (Return = {})".format(avg_eval_reward))
-
-                # 保存评估指标
-                with open(self.eval_fn, 'a') as out:
-                    out.write("{},{}\n".format(np.mean(test.ep_returns), np.mean(test.ep_lens)))
-                test_ep_lens.append(np.mean(test.ep_lens))
-                test_ep_returns.append(np.mean(test.ep_returns))
-
-                # 绘制评估曲线
-                plt.clf()
-                xlabel = [i*self.eval_freq for i in range(len(test_ep_lens))]
-                plt.plot(xlabel, test_ep_lens, color='blue', marker='o', label='Ep lens')
-                plt.plot(xlabel, test_ep_returns, color='green', marker='o', label='Returns')
-                plt.xticks(np.arange(0, itr+1, step=self.eval_freq))
-                plt.xlabel('Iterations')
-                plt.ylabel('Returns/Episode lengths')
-                plt.legend()
-                plt.grid()
-                plt.savefig(os.path.join(self.save_path, 'eval.svg'), bbox_inches='tight')
-
-                # 保存策略
-                self.save(policy, critic, "_" + repr(itr))
-
-                # 如果是最佳模型，保存为actor.pt
-                if self.highest_reward < avg_eval_reward:
-                    self.highest_reward = avg_eval_reward
-                    self.save(policy, critic)
-
-                if self.use_wandb:
-                    log_data = {
-                        "eval/iter": itr,
-                        "eval/ep_returns": float(np.mean(test.ep_returns)),
-                        "eval/ep_lens": float(np.mean(test.ep_lens)),
-                        "eval/best_ep_returns": float(self.highest_reward),
-                    }
-                    eval_index = (itr + 1) // self.eval_freq
-                    should_log_video = self.wandb_video_freq > 0 and (eval_index % self.wandb_video_freq == 0)
-                    if should_log_video:
-                        video = self.render_eval_video(env_fn, self.policy, max_steps=self.wandb_video_len)
-                        if video is not None:
-                            log_data["eval/video"] = wandb.Video(video, fps=self.wandb_video_fps, format="gif")
-                    wandb.log(log_data, step=itr)
+                self.run_evaluation(env_fn, itr, test_ep_returns, test_ep_lens)
 
         if self.use_wandb and self.wandb_run is not None:
             self.wandb_run.finish()
