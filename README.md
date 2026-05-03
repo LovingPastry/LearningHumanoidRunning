@@ -1,6 +1,8 @@
 <h1 align="center"><a href="https://github.com/LovingPastry/LearningHumanoidRunning">LearningHumanoidRunning</a></h1>
 
-![climb_down](https://github.com/user-attachments/assets/0cbca7ab-ade9-4e77-9b5c-9d2fafead47f)
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/0cbca7ab-ade9-4e77-9b5c-9d2fafead47f" alt="climb_down" />
+</p>
 
 这是一个使用强化学习训练人形机器人奔跑的项目，基于 https://github.com/rohanpsingh/LearningHumanoidWalking 修改而来，主要新增了以下能力：
 1. 仅使用双腿进行奔跑。
@@ -237,4 +239,6 @@ PYTHONPATH=.:$PYTHONPATH python scripts/debug_stepper.py --path <path_to_exp_dir
 
 #### **你应该看到的效果：**
 
+<h1 align="center">
 https://github.com/user-attachments/assets/08628f41-29f4-463e-947a-f9cd4d0b210c
+</a></h1>
